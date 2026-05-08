@@ -1,39 +1,55 @@
 import os
 import re
 from datetime import datetime
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.mongo import MongoStorage
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
-    InlineKeyboardButton, ReplyKeyboardRemove, FSInputFile
+    InlineKeyboardButton, ReplyKeyboardRemove
 )
 
+# ---------- MongoDB & Storage (with fallback) ----------
 from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
 
+# Try to import MongoStorage from aiogram 3.x, fallback to older contrib
+try:
+    from aiogram.fsm.storage.mongo import MongoStorage
+    MONGO_STORAGE_AVAILABLE = True
+except ImportError:
+    try:
+        from aiogram.contrib.fsm_storage.mongo import MongoStorage
+        MONGO_STORAGE_AVAILABLE = True
+    except ImportError:
+        MONGO_STORAGE_AVAILABLE = False
+        print("⚠️ MongoStorage not available – using MemoryStorage (FSM state lost on restart)")
+
+from dotenv import load_dotenv
 load_dotenv()
 
-# -------------------- Configuration --------------------
+# ---------- Configuration ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# MongoDB setup
+# MongoDB client for data storage
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client.mobicash_bot
 users_collection = db.users
 
-# Bot and dispatcher
+# Choose FSM storage
+if MONGO_STORAGE_AVAILABLE and MONGO_URI:
+    storage = MongoStorage.from_url(MONGO_URI, db_name="mobicash_bot_fsm")
+else:
+    from aiogram.fsm.storage.memory import MemoryStorage
+    storage = MemoryStorage()
+
 bot = Bot(token=BOT_TOKEN)
-storage = MongoStorage.from_url(MONGO_URI, db_name="mobicash_bot_fsm")
 dp = Dispatcher(storage=storage)
 
-# -------------------- FSM States --------------------
+# ---------- FSM States ----------
 class RegisterStates(StatesGroup):
     agree = State()
     location = State()
@@ -51,21 +67,19 @@ class RegisterStates(StatesGroup):
 class AdminReplyStates(StatesGroup):
     waiting_for_rejection = State()
 
-# -------------------- Helper Functions --------------------
+# ---------- Helper Functions ----------
 def validate_name(name: str) -> bool:
-    """Validate name: 2-4 words, allowed chars, max 40 chars, not all caps."""
     name = name.strip()
     if len(name) > 40:
         return False
+    # Allow letters (English, Russian, French), hyphens, apostrophes, periods
     pattern = r"^[A-Za-zÀ-ÿА-Яа-я'\-\.]+(?:\s+[A-Za-zÀ-ÿА-Яа-я'\-\.]+){1,3}$"
     if not re.match(pattern, name):
         return False
     if name.isupper():
         return False
     words = name.split()
-    if not (2 <= len(words) <= 4):
-        return False
-    return True
+    return 2 <= len(words) <= 4
 
 def validate_gaming_id(gid: str) -> bool:
     return bool(re.fullmatch(r"\d{9,11}", gid.strip()))
@@ -87,7 +101,7 @@ async def get_user_status(user_id: int) -> str:
     doc = await users_collection.find_one({"user_id": user_id})
     return doc.get("status", "not_registered") if doc else "not_registered"
 
-# -------------------- Reply Keyboards --------------------
+# ---------- Keyboards ----------
 def get_agree_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ I Agree", callback_data="agree_yes")]
@@ -102,11 +116,10 @@ def get_phone_keyboard():
     return ReplyKeyboardMarkup(keyboard=[[button]], resize_keyboard=True, one_time_keyboard=True)
 
 def get_currency_keyboard(local_currency: str):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💵 USD (Default)", callback_data="currency_usd")],
         [InlineKeyboardButton(text=f"💶 {local_currency} (Local)", callback_data=f"currency_{local_currency}")]
     ])
-    return keyboard
 
 def get_experience_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -121,27 +134,24 @@ def get_topup_keyboard():
     ])
 
 def get_main_menu_keyboard():
-    keyboard = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📋 Request Status")]],
         resize_keyboard=True
     )
-    return keyboard
 
-# -------------------- Handlers --------------------
+# ---------- Handlers ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
     status = await get_user_status(user.id)
     if status in ["pending", "approved"]:
         await message.answer(
-            f"Welcome back, {user.first_name}!\nYour registration is {status.upper()}. Use the button below to check status.",
+            f"Welcome back, {user.first_name}!\nYour registration is {status.upper()}.\nUse the button below to check status.",
             reply_markup=get_main_menu_keyboard()
         )
         return
     elif status == "rejected":
-        await message.answer(
-            "Your registration was rejected. Use /start to begin a new registration."
-        )
+        await message.answer("Your registration was rejected. Use /start to begin a new registration.")
         return
 
     await state.set_state(RegisterStates.agree)
@@ -167,7 +177,7 @@ async def agree_callback(callback: types.CallbackQuery, state: FSMContext):
 async def location_received(message: types.Message, state: FSMContext):
     lat = message.location.latitude
     lon = message.location.longitude
-    await state.update_data(location={"lat": lat, "lon": lon}, country="Unknown")  # No external API
+    await state.update_data(location={"lat": lat, "lon": lon}, country="Unknown")
     await message.answer(
         f"📍 Location received.\n\n📞 Next step: share your phone number.",
         reply_markup=get_phone_keyboard()
@@ -202,8 +212,8 @@ async def name_received(message: types.Message, state: FSMContext):
         await message.answer("❌ Invalid name. Please follow the rules and try again.")
         return
     await state.update_data(full_name=name)
-    local_currency = "EUR"  # Default fallback, user can select USD or local (but we don't know country)
-    # Instead of auto country detection, ask user to select from list? For simplicity, we show USD + a generic local.
+    # Default local currency (user can still pick USD or this)
+    local_currency = "EUR"
     await state.update_data(local_currency=local_currency)
     await message.answer(
         f"✅ Name: {name}\n\n💰 Select your preferred currency:",
@@ -309,7 +319,7 @@ async def gaming_id_received(message: types.Message, state: FSMContext):
     )
     await state.set_state(RegisterStates.registered)
 
-# -------------------- User Status Check --------------------
+# ---------- User Status Check ----------
 @dp.message(F.text == "📋 Request Status")
 async def check_status(message: types.Message):
     status = await get_user_status(message.from_user.id)
@@ -324,7 +334,7 @@ async def check_status(message: types.Message):
     else:
         await message.answer("Use /start to begin registration.")
 
-# -------------------- Admin Commands --------------------
+# ---------- Admin Commands ----------
 @dp.message(Command("listpending"))
 async def list_pending(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -392,7 +402,7 @@ async def reject_send(message: types.Message, state: FSMContext):
     await message.answer(f"User {user_id} rejected.")
     await state.clear()
 
-# -------------------- User Replies to Admin --------------------
+# ---------- Forward user replies to admin ----------
 @dp.message(F.reply_to_message)
 async def forward_user_reply_to_admin(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
@@ -405,7 +415,7 @@ async def forward_user_reply_to_admin(message: types.Message):
             except:
                 pass
 
-# -------------------- Start --------------------
+# ---------- Start Bot ----------
 async def main():
     await dp.start_polling(bot)
 
