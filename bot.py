@@ -1,8 +1,7 @@
 import os
 import re
-import asyncio
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -10,13 +9,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.mongo import MongoStorage
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
     InlineKeyboardButton, ReplyKeyboardRemove, FSInputFile
 )
-from aiogram.utils.markdown import hbold
 
 from motor.motor_asyncio import AsyncIOMotorClient
-import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,7 +27,6 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client.mobicash_bot
 users_collection = db.users
-admin_chat_collection = db.admin_chat  # For reply threads
 
 # Bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -39,7 +35,6 @@ dp = Dispatcher(storage=storage)
 
 # -------------------- FSM States --------------------
 class RegisterStates(StatesGroup):
-    start = State()
     agree = State()
     location = State()
     phone = State()
@@ -51,84 +46,38 @@ class RegisterStates(StatesGroup):
     street = State()
     topup_method = State()
     gaming_id = State()
-    registered = State()  # pending approval
+    registered = State()
 
 class AdminReplyStates(StatesGroup):
     waiting_for_rejection = State()
 
 # -------------------- Helper Functions --------------------
 def validate_name(name: str) -> bool:
-    """Validate name: 2-4 words, allowed chars (A-Z a-z А-Я а-я French), no all caps, max 40 chars."""
+    """Validate name: 2-4 words, allowed chars, max 40 chars, not all caps."""
     name = name.strip()
     if len(name) > 40:
         return False
-    # Allow letters (English, Russian, French diacritics), hyphens, apostrophes, periods, spaces
-    # French letters: àâäéèêëîïôöùûüÿç - we'll use Unicode category L + basic punctuation
     pattern = r"^[A-Za-zÀ-ÿА-Яа-я'\-\.]+(?:\s+[A-Za-zÀ-ÿА-Яа-я'\-\.]+){1,3}$"
     if not re.match(pattern, name):
         return False
-    # Check not all uppercase (allow normal case)
     if name.isupper():
         return False
-    # Count words (split by space)
     words = name.split()
     if not (2 <= len(words) <= 4):
         return False
     return True
 
 def validate_gaming_id(gid: str) -> bool:
-    """Numeric, 9-11 digits."""
     return bool(re.fullmatch(r"\d{9,11}", gid.strip()))
 
-async def get_country_from_coords(lat: float, lon: float) -> Optional[str]:
-    """Reverse geocoding using Nominatim."""
-    async with aiohttp.ClientSession() as session:
-        url = "https://nominatim.openstreetmap.org/reverse"
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "format": "json",
-            "accept-language": "en"
-        }
-        headers = {"User-Agent": "MobicashBot/1.0"}
-        try:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    country = data.get("address", {}).get("country")
-                    return country
-        except:
-            return None
-    return None
-
-def get_currency_for_country(country: str) -> str:
-    """Simple mapping for demo (add more as needed)."""
-    mapping = {
-        "United States": "USD",
-        "Canada": "CAD",
-        "United Kingdom": "GBP",
-        "European Union": "EUR",
-        "Germany": "EUR",
-        "France": "EUR",
-        "Russia": "RUB",
-        "India": "INR",
-    }
-    return mapping.get(country, "USD")  # fallback to USD
-
 async def save_user_data(user_id: int, data: dict):
-    """Save or update user data in MongoDB."""
     await users_collection.update_one(
         {"user_id": user_id},
         {"$set": {"data": data, "updated_at": datetime.utcnow()}},
         upsert=True
     )
 
-async def get_user_data(user_id: int) -> Optional[dict]:
-    doc = await users_collection.find_one({"user_id": user_id})
-    return doc.get("data") if doc else None
-
 async def set_user_status(user_id: int, status: str, rejection_msg: str = None):
-    """status: pending, approved, rejected"""
     await users_collection.update_one(
         {"user_id": user_id},
         {"$set": {"status": status, "rejection_msg": rejection_msg, "updated_at": datetime.utcnow()}}
@@ -182,23 +131,19 @@ def get_main_menu_keyboard():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
-    # Check if already registered (pending, approved, rejected)
     status = await get_user_status(user.id)
     if status in ["pending", "approved"]:
         await message.answer(
-            f"Welcome back, {user.first_name}!\n"
-            f"Your registration is {status.upper()}. Use the button below to check status.",
+            f"Welcome back, {user.first_name}!\nYour registration is {status.upper()}. Use the button below to check status.",
             reply_markup=get_main_menu_keyboard()
         )
         return
     elif status == "rejected":
         await message.answer(
-            "Your registration was rejected. Please contact admin if you think this is a mistake.\n"
-            "Use /start to begin a new registration."
+            "Your registration was rejected. Use /start to begin a new registration."
         )
         return
 
-    # New user -> show agreement
     await state.set_state(RegisterStates.agree)
     await message.answer(
         f"Hello, {user.full_name}!\n\n"
@@ -215,84 +160,53 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def agree_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(RegisterStates.location)
-    await callback.message.edit_text(
-        "✅ You have agreed to the terms.\n\n"
-        "📍 Please share your current location using the button below.\n"
-        "*(Only works on smartphones)*"
-    )
-    await callback.message.answer(
-        "Tap the button to share location:",
-        reply_markup=get_location_keyboard()
-    )
+    await callback.message.edit_text("✅ You agreed to the terms.\n\n📍 Please share your current location using the button below.")
+    await callback.message.answer("Tap the button to share location:", reply_markup=get_location_keyboard())
 
 @dp.message(RegisterStates.location, F.location)
 async def location_received(message: types.Message, state: FSMContext):
     lat = message.location.latitude
     lon = message.location.longitude
-    # Store raw coordinates
-    await state.update_data(location={"lat": lat, "lon": lon})
-    # Reverse geocode to get country
-    country = await get_country_from_coords(lat, lon)
-    if not country:
-        country = "Unknown"
-    await state.update_data(country=country)
+    await state.update_data(location={"lat": lat, "lon": lon}, country="Unknown")  # No external API
     await message.answer(
-        f"📍 Location received. Your country: {country}\n\n"
-        "📞 Next step: share your phone number.",
+        f"📍 Location received.\n\n📞 Next step: share your phone number.",
         reply_markup=get_phone_keyboard()
     )
     await state.set_state(RegisterStates.phone)
 
 @dp.message(RegisterStates.location)
-async def location_missing(message: types.Message, state: FSMContext):
+async def location_missing(message: types.Message):
     await message.answer("Please share your location using the button below.", reply_markup=get_location_keyboard())
 
 @dp.message(RegisterStates.phone, F.contact)
 async def phone_received(message: types.Message, state: FSMContext):
-    contact = message.contact
-    phone = contact.phone_number
+    phone = message.contact.phone_number
     await state.update_data(phone=phone)
     await message.answer(
-        f"✅ Phone number saved: {phone}\n\n"
-        "✏️ Now, enter your real first and last name as in your ID/passport.\n"
-        "Requirements:\n"
-        "• 2-4 words\n"
-        "• English, Russian, or French letters (no numbers, not all caps)\n"
-        "• Hyphens, apostrophes, periods allowed\n"
-        "• Max 40 characters\n\n"
-        "Example: John Doe, Jean-Pierre Dupont, Иван Петров",
+        f"✅ Phone saved: {phone}\n\n"
+        "✏️ Enter your real first and last name (as in ID/passport).\n"
+        "Requirements:\n• 2-4 words\n• English/Russian/French letters, hyphens, apostrophes, periods\n• Max 40 chars\n\n"
+        "Example: John Doe or Jean-Pierre Dupont",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(RegisterStates.name)
 
 @dp.message(RegisterStates.phone)
-async def phone_missing(message: types.Message, state: FSMContext):
+async def phone_missing(message: types.Message):
     await message.answer("Please share your phone number using the button below.", reply_markup=get_phone_keyboard())
 
 @dp.message(RegisterStates.name)
 async def name_received(message: types.Message, state: FSMContext):
     name = message.text.strip()
     if not validate_name(name):
-        await message.answer(
-            "❌ Invalid name.\n"
-            "Make sure:\n"
-            "• 2-4 words\n"
-            "• Only letters (English/Russian/French), hyphens, apostrophes, periods\n"
-            "• Not all uppercase\n"
-            "• Max 40 characters\n\n"
-            "Please try again:"
-        )
+        await message.answer("❌ Invalid name. Please follow the rules and try again.")
         return
     await state.update_data(full_name=name)
-    # Now ask for currency - but we need country from location (already in state)
-    data = await state.get_data()
-    country = data.get("country", "Unknown")
-    local_currency = get_currency_for_country(country)
+    local_currency = "EUR"  # Default fallback, user can select USD or local (but we don't know country)
+    # Instead of auto country detection, ask user to select from list? For simplicity, we show USD + a generic local.
     await state.update_data(local_currency=local_currency)
     await message.answer(
-        f"✅ Name accepted: {name}\n\n"
-        f"🌍 Your country: {country}\n"
-        f"💰 Select your preferred currency (only one):",
+        f"✅ Name: {name}\n\n💰 Select your preferred currency:",
         reply_markup=get_currency_keyboard(local_currency)
     )
     await state.set_state(RegisterStates.currency)
@@ -302,49 +216,24 @@ async def currency_selected(callback: types.CallbackQuery, state: FSMContext):
     currency = callback.data.split("_")[1].upper()
     await state.update_data(selected_currency=currency)
     await callback.answer(f"Currency: {currency}")
-    await callback.message.edit_text(
-        f"💱 Currency set to: {currency}\n\n"
-        "📄 Now, please send a photo of your **Identity Document** (Passport / ID Card / Driving License)."
-    )
+    await callback.message.edit_text(f"💱 Currency set: {currency}\n\n📄 Now send a photo of your **Identity Document** (Passport/ID/License).")
     await state.set_state(RegisterStates.id_photo)
 
 @dp.message(RegisterStates.id_photo, F.photo)
 async def id_photo_received(message: types.Message, state: FSMContext):
-    photo = message.photo[-1]  # largest size
-    file_id = photo.file_id
+    file_id = message.photo[-1].file_id
     await state.update_data(id_photo_file_id=file_id)
-    await message.answer(
-        "✅ First document received.\n\n"
-        "📸 Now, please send **another photo** (e.g., selfie with document or second ID)."
-    )
+    await message.answer("✅ First document received.\n\n📸 Now send **another photo** (e.g., selfie with document).")
     await state.set_state(RegisterStates.second_photo)
 
 @dp.message(RegisterStates.id_photo)
-async def id_photo_missing(message: types.Message, state: FSMContext):
-    await message.answer("Please send a photo of your identity document (Passport/ID/License).")
+async def id_photo_missing(message: types.Message):
+    await message.answer("Please send a photo of your identity document.")
 
 @dp.message(RegisterStates.second_photo, F.photo)
 async def second_photo_received(message: types.Message, state: FSMContext):
-    photo = message.photo[-1]
-    file_id = photo.file_id
+    file_id = message.photo[-1].file_id
     await state.update_data(second_photo_file_id=file_id)
-    # Show example image (you need to upload an example photo to Telegram first or send a URL)
-    example_path = "experience_example.jpg"  # Place an example image in your bot directory
-    if os.path.exists(example_path):
-        await message.answer_photo(
-            FSInputFile(example_path),
-            caption="ℹ️ Example: Yes/No selection\n\n"
-                    "Do you have experience working with the MobCash mobile app?"
-        )
-    else:
-        await message.answer(
-            "Do you have experience working with the MobCash mobile app?\n"
-            "Select one option:",
-            reply_markup=get_experience_keyboard()
-        )
-        await state.set_state(RegisterStates.experience)
-        return
-
     await message.answer(
         "Do you have experience working with the MobCash mobile app?",
         reply_markup=get_experience_keyboard()
@@ -352,47 +241,26 @@ async def second_photo_received(message: types.Message, state: FSMContext):
     await state.set_state(RegisterStates.experience)
 
 @dp.message(RegisterStates.second_photo)
-async def second_photo_missing(message: types.Message, state: FSMContext):
-    await message.answer("Please send the second photo (e.g., selfie or second document).")
+async def second_photo_missing(message: types.Message):
+    await message.answer("Please send the second photo.")
 
 @dp.callback_query(RegisterStates.experience, F.data.startswith("exp_"))
 async def experience_selected(callback: types.CallbackQuery, state: FSMContext):
-    exp = callback.data.split("_")[1]  # "yes" or "no"
+    exp = callback.data.split("_")[1]
     await state.update_data(experience=exp)
     await callback.answer()
-    await callback.message.edit_text(
-        f"✅ Experience: {'Yes' if exp == 'yes' else 'No'}\n\n"
-        "🏠 Please enter your **street name** (only the name, not full address).\n"
-        "It will be visible to players picking a cashier for withdrawals."
-    )
+    await callback.message.edit_text(f"✅ Experience: {'Yes' if exp == 'yes' else 'No'}\n\n🏠 Please enter your **street name** (only the name, not full address).")
     await state.set_state(RegisterStates.street)
 
 @dp.message(RegisterStates.street)
 async def street_received(message: types.Message, state: FSMContext):
     street = message.text.strip()
     if len(street) < 2:
-        await message.answer("Please enter a valid street name (at least 2 characters).")
+        await message.answer("Please enter a valid street name (≥2 chars).")
         return
     await state.update_data(street=street)
-    # Show top-up method example photo
-    example_path = "topup_example.jpg"
-    if os.path.exists(example_path):
-        await message.answer_photo(
-            FSInputFile(example_path),
-            caption="How would you like to top up your account to register as a mobile cash agent?\n"
-                    "Choose one method:"
-        )
-    else:
-        await message.answer(
-            "How would you like to top up your account to register as a mobile cash agent?\n"
-            "Choose one method (you can only use one):",
-            reply_markup=get_topup_keyboard()
-        )
-        await state.set_state(RegisterStates.topup_method)
-        return
-
     await message.answer(
-        "How would you like to top up your account?",
+        "How would you like to top up your account? (choose one)",
         reply_markup=get_topup_keyboard()
     )
     await state.set_state(RegisterStates.topup_method)
@@ -404,8 +272,7 @@ async def topup_selected(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.edit_text(
         f"✅ Top-up method: {'USDT' if method == 'usdt' else 'Other Crypto'}\n\n"
-        "🎮 Now, send your **gaming ID from your 7starswin profile**.\n"
-        "It's a numeric ID (9-11 digits). You can copy it from the app or your profile."
+        "🎮 Send your **gaming ID from 7starswin profile** (9-11 digits, numbers only)."
     )
     await state.set_state(RegisterStates.gaming_id)
 
@@ -413,14 +280,9 @@ async def topup_selected(callback: types.CallbackQuery, state: FSMContext):
 async def gaming_id_received(message: types.Message, state: FSMContext):
     gid = message.text.strip()
     if not validate_gaming_id(gid):
-        await message.answer(
-            "❌ Invalid Gaming ID.\n"
-            "It must be a **numeric ID** with **9 to 11 digits**.\n"
-            "Please re-check and send the correct number:"
-        )
+        await message.answer("❌ Invalid Gaming ID. Must be 9-11 digits. Try again.")
         return
     await state.update_data(gaming_id=gid)
-    # All data collected. Save to DB and set status pending
     user_data = await state.get_data()
     user_data["user_id"] = message.from_user.id
     user_data["username"] = message.from_user.username
@@ -436,51 +298,42 @@ async def gaming_id_received(message: types.Message, state: FSMContext):
         try:
             await bot.send_message(
                 admin_id,
-                f"🆕 New registration pending!\n"
-                f"User: {message.from_user.full_name} (@{message.from_user.username})\n"
-                f"ID: {message.from_user.id}\n"
-                f"Use /approve {message.from_user.id} or /reject {message.from_user.id}"
+                f"🆕 New registration pending!\nUser: {message.from_user.full_name} (@{message.from_user.username})\nID: {message.from_user.id}\nUse /approve {message.from_user.id} or /reject {message.from_user.id}"
             )
         except:
             pass
 
     await message.answer(
-        "✅ **Registration complete!**\n\n"
-        "Your application is now pending admin approval.\n"
-        "You will be notified once approved or rejected.\n"
-        "Use the button below to check your status.",
-        reply_markup=get_main_menu_keyboard(),
-        parse_mode="Markdown"
+        "✅ Registration complete! Your application is pending admin approval.\nUse the button below to check status.",
+        reply_markup=get_main_menu_keyboard()
     )
     await state.set_state(RegisterStates.registered)
 
 # -------------------- User Status Check --------------------
 @dp.message(F.text == "📋 Request Status")
-async def check_status(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    status = await get_user_status(user_id)
+async def check_status(message: types.Message):
+    status = await get_user_status(message.from_user.id)
     if status == "pending":
-        await message.answer("⏳ Your registration is **under review**. Please wait for admin approval.")
+        await message.answer("⏳ Your registration is under review.")
     elif status == "approved":
-        await message.answer("✅ **Approved!** You are now a registered Mobicash agent. Thank you.")
+        await message.answer("✅ Approved! You are now a registered Mobicash agent.")
     elif status == "rejected":
-        data = await users_collection.find_one({"user_id": user_id})
-        rejection_msg = data.get("rejection_msg", "No reason provided.") if data else "No reason provided."
-        await message.answer(f"❌ **Rejected**.\nReason: {rejection_msg}\n\nContact admin if you have questions.")
+        doc = await users_collection.find_one({"user_id": message.from_user.id})
+        reason = doc.get("rejection_msg", "No reason provided.") if doc else "No reason."
+        await message.answer(f"❌ Rejected.\nReason: {reason}")
     else:
-        await message.answer("You have not started registration. Use /start to begin.")
+        await message.answer("Use /start to begin registration.")
 
 # -------------------- Admin Commands --------------------
 @dp.message(Command("listpending"))
 async def list_pending(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Unauthorized.")
         return
     pending = await users_collection.find({"status": "pending"}).to_list(None)
     if not pending:
         await message.answer("No pending registrations.")
         return
-    text = "📋 **Pending users:**\n"
+    text = "📋 Pending users:\n"
     for user in pending:
         uid = user["user_id"]
         username = user["data"].get("username", "N/A")
@@ -490,78 +343,61 @@ async def list_pending(message: types.Message):
 @dp.message(Command("approve"))
 async def approve_user(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Unauthorized.")
         return
     parts = message.text.split()
     if len(parts) != 2:
         await message.answer("Usage: /approve <user_id>")
         return
     user_id = int(parts[1])
-    user_data = await users_collection.find_one({"user_id": user_id})
-    if not user_data:
+    user = await users_collection.find_one({"user_id": user_id})
+    if not user:
         await message.answer("User not found.")
         return
     await set_user_status(user_id, "approved")
-    await bot.send_message(user_id, "🎉 Congratulations! Your registration has been **approved**. You can now use the Mobicash agent services.")
-    await message.answer(f"User {user_id} approved successfully.")
+    await bot.send_message(user_id, "🎉 Congratulations! Your registration has been approved.")
+    await message.answer(f"User {user_id} approved.")
 
 @dp.message(Command("reject"))
 async def reject_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Unauthorized.")
         return
     parts = message.text.split()
     if len(parts) != 2:
-        await message.answer("Usage: /reject <user_id>\nThen send the rejection reason (text, photo, or video).")
+        await message.answer("Usage: /reject <user_id>")
         return
     user_id = int(parts[1])
-    # Verify user exists
-    user_data = await users_collection.find_one({"user_id": user_id})
-    if not user_data:
+    user = await users_collection.find_one({"user_id": user_id})
+    if not user:
         await message.answer("User not found.")
         return
     await state.update_data(reject_user_id=user_id)
     await state.set_state(AdminReplyStates.waiting_for_rejection)
-    await message.answer(f"Now send the rejection message for user {user_id} (text, photo, or video). This will be forwarded to the user.")
+    await message.answer(f"Send rejection message for user {user_id} (text, photo, or video).")
 
 @dp.message(AdminReplyStates.waiting_for_rejection, F.text | F.photo | F.video)
 async def reject_send(message: types.Message, state: FSMContext):
     data = await state.get_data()
     user_id = data["reject_user_id"]
-    # Save rejection message content
-    rejection_content = {}
+    rejection_text = "Your registration has been rejected."
     if message.text:
-        rejection_content["type"] = "text"
-        rejection_content["text"] = message.text
-        await bot.send_message(user_id, f"❌ Your registration has been rejected.\nReason: {message.text}")
+        rejection_text = message.text
+        await bot.send_message(user_id, f"❌ {rejection_text}")
     elif message.photo:
-        rejection_content["type"] = "photo"
-        rejection_content["file_id"] = message.photo[-1].file_id
         await bot.send_photo(user_id, message.photo[-1].file_id, caption="❌ Your registration has been rejected.")
+        rejection_text = "Rejected with photo."
     elif message.video:
-        rejection_content["type"] = "video"
-        rejection_content["file_id"] = message.video.file_id
         await bot.send_video(user_id, message.video.file_id, caption="❌ Your registration has been rejected.")
-    # Update status and store rejection message
-    await set_user_status(user_id, "rejected", rejection_msg=rejection_content.get("text", "Rejected by admin"))
-    await message.answer(f"User {user_id} rejected. Notification sent.")
+        rejection_text = "Rejected with video."
+    await set_user_status(user_id, "rejected", rejection_msg=rejection_text)
+    await message.answer(f"User {user_id} rejected.")
     await state.clear()
 
-@dp.message(AdminReplyStates.waiting_for_rejection)
-async def reject_invalid(message: types.Message):
-    await message.answer("Please send a text, photo, or video as rejection reason.")
-
-# -------------------- User Replies to Admin Messages --------------------
-# When a user replies to a message from admin, forward to admin
+# -------------------- User Replies to Admin --------------------
 @dp.message(F.reply_to_message)
-async def handle_user_reply(message: types.Message):
-    # Check if the replied message was sent by bot and is a rejection/forwarded admin message
-    # Simpler approach: store admin-user conversation mapping in DB? For now, if user replies to any bot message, forward to all admins
+async def forward_user_reply_to_admin(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
-        return  # avoid loops
-    # Only if user has pending/rejected/approved status? Actually any reply to bot should go to admins
-    if message.reply_to_message.from_user.id == bot.id:
-        # Forward to all admins
+        return
+    if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         for admin_id in ADMIN_IDS:
             try:
                 await bot.forward_message(admin_id, message.chat.id, message.message_id)
@@ -569,13 +405,10 @@ async def handle_user_reply(message: types.Message):
             except:
                 pass
 
-# -------------------- Error Handling & Startup --------------------
-@dp.startup()
-async def on_startup():
-    await bot.send_message(ADMIN_IDS[0], "🤖 Bot started!")
-
+# -------------------- Start --------------------
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
