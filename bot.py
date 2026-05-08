@@ -1,7 +1,9 @@
 import os
 import re
+import sys
+import asyncio
+import traceback
 from datetime import datetime
-from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -11,34 +13,50 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
     InlineKeyboardButton, ReplyKeyboardRemove
 )
-
-# ---------- MongoDB setup ----------
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv()  # loads .env only if present (local development)
 
 # ---------- Configuration ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# MongoDB client for persistent storage
+# Validate required variables
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN environment variable not set.", flush=True)
+    sys.exit(1)
+if not MONGO_URI:
+    print("ERROR: MONGO_URI environment variable not set.", flush=True)
+    sys.exit(1)
+if not ADMIN_IDS:
+    print("ERROR: ADMIN_IDS environment variable not set.", flush=True)
+    sys.exit(1)
+
+print(f"✅ BOT_TOKEN loaded (first 5 chars: {BOT_TOKEN[:5]}...)", flush=True)
+print(f"✅ MONGO_URI loaded (first 10 chars: {MONGO_URI[:10]}...)", flush=True)
+print(f"✅ ADMIN_IDS loaded: {ADMIN_IDS}", flush=True)
+
+# ---------- MongoDB client ----------
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client.mobicash_bot
 users_collection = db.users
 
-# ---------- FSM storage (MongoDB, fallback to memory) ----------
+# ---------- FSM storage (MongoDB with fallback) ----------
 try:
     from aiogram.fsm.storage.mongo import MongoStorage
     storage = MongoStorage.from_url(MONGO_URI, db_name="mobicash_bot_fsm")
-except Exception:
+    print("✅ Using MongoStorage for FSM", flush=True)
+except Exception as e:
     from aiogram.fsm.storage.memory import MemoryStorage
     storage = MemoryStorage()
+    print(f"⚠️ MongoStorage failed, using MemoryStorage: {e}", flush=True)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ---------- States ----------
+# ---------- FSM States ----------
 class Form(StatesGroup):
     agree = State()
     location = State()
@@ -201,7 +219,6 @@ async def got_name(message: types.Message, state: FSMContext):
         await message.answer("❌ Invalid name. Please follow the rules and try again.")
         return
     await state.update_data(full_name=name)
-    # Default local currency (can be changed later, but we keep simple)
     await state.update_data(local_currency="EUR")
     await message.answer(f"✅ Name: {name}\n\n💰 Choose currency:", reply_markup=currency_kb("EUR"))
     await state.set_state(Form.currency)
@@ -397,11 +414,18 @@ async def forward_reply(message: types.Message):
             except:
                 pass
 
-# ---------- Start bot (with webhook deletion) ----------
+# ---------- Start bot with error logging ----------
 async def main():
+    print("== BOT STARTING ==", flush=True)
+    print("Deleting webhook...", flush=True)
     await bot.delete_webhook(drop_pending_updates=True)
+    print("Webhook deleted. Starting polling...", flush=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print("FATAL UNHANDLED EXCEPTION:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
