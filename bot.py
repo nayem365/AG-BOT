@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from typing import Optional
 
 import aiohttp
@@ -15,6 +16,7 @@ from aiogram.types import (
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 )
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import ServerSelectionTimeoutError
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,13 +32,25 @@ if not ADMIN_IDS:
     logging.warning("No ADMIN_IDS set – admin features disabled")
 
 # ========== LOGGING ==========
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# ========== DATABASE ==========
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+# ========== DATABASE (with connection test) ==========
+mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client.mobicash_bot
 users_collection = db.users
+
+async def test_mongo_connection():
+    """Verify MongoDB is reachable before starting the bot."""
+    try:
+        await mongo_client.admin.command('ping')
+        logger.info("MongoDB connection successful")
+    except ServerSelectionTimeoutError as e:
+        logger.error(f"MongoDB connection failed: {e}")
+        raise
 
 # ========== BOT & DISPATCHER ==========
 bot = Bot(token=BOT_TOKEN)
@@ -421,12 +435,23 @@ async def reject_reason(message: types.Message, state: FSMContext):
 async def forward_reply(message: types.Message):
     await forward_to_admins(message)
 
-# ========== MAIN ==========
+# ========== MAIN WITH AUTO-RESTART ON CRASH ==========
 async def main():
+    # Test MongoDB before anything else
+    await test_mongo_connection()
+    
+    # Delete webhook and start polling
     await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(1)  # Critical: ensures webhook is fully removed
+    await asyncio.sleep(1)
     logger.info("Bot started polling...")
-    await dp.start_polling(bot)
+    
+    # Keep polling forever; if it crashes, restart polling
+    while True:
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            logger.exception(f"Polling crashed: {e}. Restarting in 5 seconds...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
